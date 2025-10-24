@@ -1,0 +1,18 @@
+[toolchain]
+
+[features]
+seeds = false
+skip-lint = false
+
+[programs.localnet]
+instinct_trading = "6EYowRZgeA51JkwPJ5R1wnhxTYHYumnGYrNZwcGegCnc"
+
+[registry]
+url = "https://api.apr.dev"
+
+[provider]
+cluster = "Localnet"
+wallet = "/home/bhagaskara/.config/solana/id.json"
+
+[scripts]
+test = "yarn run mocha -t 1000000 tests/"

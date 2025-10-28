@@ -20,6 +20,8 @@ pub mod instinct_trading {
         platform.total_runs = 0;
         platform.is_paused = false;
         platform.bump = ctx.bumps.platform;
+        platform.total_fees_collected = 0;
+        platform.platform_fee_vault = ctx.accounts.platform_fee_vault.key();
 
         msg!("Platform initialized with {}% fee", platform_fee_bps as f64 / 100.0);
         Ok(())
@@ -27,7 +29,7 @@ pub mod instinct_trading {
 
     /// Create vault for a run (must be called before users can deposit)
     pub fn create_run_vault(
-        ctx: Context<CreateRunVault>,
+        _ctx: Context<CreateRunVault>,
         run_id: u64,
     ) -> Result<()> {
         msg!("Vault created for run #{}", run_id);
@@ -53,6 +55,9 @@ pub mod instinct_trading {
         run.status = RunStatus::Waiting;
         run.total_deposited = 0;
         run.final_balance = 0;
+        run.platform_fee_amount = 0;
+        run.total_withdrawn = 0;
+        run.withdrawn_count = 0;
         run.participant_count = 0;
         run.min_deposit = min_deposit;
         run.max_deposit = max_deposit;
@@ -140,35 +145,76 @@ pub mod instinct_trading {
         final_balance: u64,
         participant_shares: Vec<ParticipantShare>,
     ) -> Result<()> {
-        let run = &mut ctx.accounts.run;
-        
-        require!(run.status == RunStatus::Active, ErrorCode::InvalidRunStatus);
-        require!(participant_shares.len() == run.participant_count as usize, ErrorCode::InvalidSharesCount);
-
         // Verify current vault balance matches reported final_balance
         let vault_balance = ctx.accounts.run_vault.amount;
         require!(vault_balance == final_balance, ErrorCode::VaultBalanceMismatch);
+        
+        // Read values we need from run before any mutable borrows
+        let run_status = ctx.accounts.run.status.clone();
+        let participant_count = ctx.accounts.run.participant_count;
+        let total_deposited = ctx.accounts.run.total_deposited;
+        let run_bump = ctx.accounts.run.bump;
+        let run_id_bytes = run_id.to_le_bytes();
+        
+        require!(run_status == RunStatus::Active, ErrorCode::InvalidRunStatus);
+        require!(participant_shares.len() == participant_count as usize, ErrorCode::InvalidSharesCount);
 
-        run.status = RunStatus::Settled;
-        run.final_balance = final_balance;
-        run.ended_at = Clock::get()?.unix_timestamp;
-
-        // Store participant shares for withdrawal
-        // Note: In production, you'd want to store this data in separate accounts
-        // For MVP, we'll handle distribution through the withdraw instruction
-
-        let profit = if final_balance > run.total_deposited {
-            final_balance - run.total_deposited
+        // Calculate platform fee ONLY on profit (not on principal)
+        let profit = if final_balance > total_deposited {
+            final_balance
+                .checked_sub(total_deposited)
+                .ok_or(ErrorCode::ArithmeticOverflow)?
         } else {
             0
         };
 
-        msg!("Run #{} settled - Initial: {} Final: {} P/L: {}{}", 
+        let platform_fee = (profit as u128)
+            .checked_mul(ctx.accounts.platform.platform_fee_bps as u128)
+            .ok_or(ErrorCode::ArithmeticOverflow)?
+            .checked_div(10000)
+            .ok_or(ErrorCode::ArithmeticOverflow)?
+            as u64;
+
+        // Transfer platform fee to platform vault (if there is profit)
+        if platform_fee > 0 {
+            let run_seeds = &[
+                b"run".as_ref(),
+                run_id_bytes.as_ref(),
+                &[run_bump],
+            ];
+            let signer = &[&run_seeds[..]];
+
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.run_vault.to_account_info(),
+                to: ctx.accounts.platform_fee_vault.to_account_info(),
+                authority: ctx.accounts.run.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+            token::transfer(cpi_ctx, platform_fee)?;
+        }
+
+        // Now update run state (mutable borrow)
+        let run = &mut ctx.accounts.run;
+        run.status = RunStatus::Settled;
+        run.final_balance = final_balance
+            .checked_sub(platform_fee)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        run.platform_fee_amount = platform_fee;
+        run.ended_at = Clock::get()?.unix_timestamp;
+
+        // Update platform totals
+        let platform = &mut ctx.accounts.platform;
+        platform.total_fees_collected = platform.total_fees_collected
+            .checked_add(platform_fee)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        msg!("Run #{} settled - Initial: {} Final: {} Fee: {} Available: {}", 
             run_id, 
-            run.total_deposited, 
+            total_deposited, 
             final_balance,
-            if profit > 0 { "+" } else { "" },
-            profit as i64
+            platform_fee,
+            run.final_balance
         );
         
         Ok(())
@@ -179,34 +225,89 @@ pub mod instinct_trading {
         ctx: Context<Withdraw>,
         run_id: u64,
     ) -> Result<()> {
-        let run = &ctx.accounts.run;
-        let participation = &mut ctx.accounts.user_participation;
+        // Read values we need before any mutable borrows
+        let run_status = ctx.accounts.run.status.clone();
+        let withdrawn_count = ctx.accounts.run.withdrawn_count;
+        let participant_count = ctx.accounts.run.participant_count;
+        let final_balance = ctx.accounts.run.final_balance;
+        let total_deposited = ctx.accounts.run.total_deposited;
+        let run_bump = ctx.accounts.run.bump;
+        let run_id_from_account = ctx.accounts.run.run_id;
+        
+        require!(run_status == RunStatus::Settled, ErrorCode::RunNotSettled);
+        require!(!ctx.accounts.user_participation.withdrawn, ErrorCode::AlreadyWithdrawn);
 
-        require!(run.status == RunStatus::Settled, ErrorCode::RunNotSettled);
-        require!(!participation.withdrawn, ErrorCode::AlreadyWithdrawn);
+        let user_share: u64;
+        let deposit_amount = ctx.accounts.user_participation.deposit_amount;
+        let correct_votes = ctx.accounts.user_participation.correct_votes;
 
-        // Calculate user's share
-        // Base share = (user_deposit / total_deposited) * final_balance
-        // Bonus share = correct_votes * 1% additional
-        let base_share_numerator = (participation.deposit_amount as u128)
-            .checked_mul(run.final_balance as u128)
-            .unwrap();
-        let mut user_share = (base_share_numerator / run.total_deposited as u128) as u64;
+        // Check if this is the last withdrawal - fixes rounding dust issue
+        let is_last_user = withdrawn_count + 1 == participant_count;
 
-        // Add bonus for correct votes (max 12% bonus if all 12 votes correct)
-        let correct_vote_bonus_bps = participation.correct_votes as u64 * 100; // 1% per correct vote
-        let bonus = (user_share as u128 * correct_vote_bonus_bps as u128 / 10000) as u64;
-        user_share += bonus;
+        if is_last_user {
+            // Last user gets all remaining balance to eliminate rounding dust
+            user_share = ctx.accounts.run_vault.amount;
+            
+            msg!(
+                "Last withdrawal - user {} gets remaining vault balance: {}",
+                ctx.accounts.user.key(),
+                user_share
+            );
+        } else {
+            // Calculate proportional share for non-last users
+            let base_share_numerator = (deposit_amount as u128)
+                .checked_mul(final_balance as u128)
+                .ok_or(ErrorCode::ArithmeticOverflow)?;
+            
+            let base_share = base_share_numerator
+                .checked_div(total_deposited as u128)
+                .ok_or(ErrorCode::ArithmeticOverflow)? as u64;
 
-        // Ensure we don't withdraw more than vault has
-        require!(user_share <= ctx.accounts.run_vault.amount, ErrorCode::InsufficientVaultFunds);
+            // Calculate bonus ONLY if there was profit (FIX #3)
+            if final_balance > total_deposited {
+                // Calculate this user's share of the profit
+                let profit_ratio = final_balance
+                    .checked_sub(total_deposited)
+                    .ok_or(ErrorCode::ArithmeticOverflow)?;
+                
+                let user_profit_share = (deposit_amount as u128)
+                    .checked_mul(profit_ratio as u128)
+                    .ok_or(ErrorCode::ArithmeticOverflow)?
+                    .checked_div(total_deposited as u128)
+                    .ok_or(ErrorCode::ArithmeticOverflow)? as u64;
+
+                // Apply bonus to profit share only (1% per correct vote)
+                let correct_vote_bonus_bps = (correct_votes as u64)
+                    .checked_mul(100)
+                    .ok_or(ErrorCode::ArithmeticOverflow)?; // 1% per vote in bps
+                
+                let bonus = (user_profit_share as u128)
+                    .checked_mul(correct_vote_bonus_bps as u128)
+                    .ok_or(ErrorCode::ArithmeticOverflow)?
+                    .checked_div(10000)
+                    .ok_or(ErrorCode::ArithmeticOverflow)? as u64;
+
+                user_share = base_share
+                    .checked_add(bonus)
+                    .ok_or(ErrorCode::ArithmeticOverflow)?;
+            } else {
+                // No bonus on losses
+                user_share = base_share;
+            }
+
+            // Ensure we don't exceed vault balance
+            require!(
+                user_share <= ctx.accounts.run_vault.amount,
+                ErrorCode::InsufficientVaultFunds
+            );
+        }
 
         // Transfer USDC from vault to user
-        let run_id_bytes = run.run_id.to_le_bytes();
+        let run_id_bytes = run_id_from_account.to_le_bytes();
         let run_seeds = &[
-            b"run",
+            b"run".as_ref(),
             run_id_bytes.as_ref(),
-            &[run.bump],
+            &[run_bump],
         ];
         let signer = &[&run_seeds[..]];
 
@@ -219,19 +320,36 @@ pub mod instinct_trading {
         let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
         token::transfer(cpi_ctx, user_share)?;
 
+        // Update participation record
+        let participation = &mut ctx.accounts.user_participation;
         participation.final_share = user_share;
         participation.withdrawn = true;
 
-        msg!("User {} withdrew {} USDC from run #{}", 
-            ctx.accounts.user.key(), user_share, run_id);
+        // Update run withdrawal tracking (FIX #2)
+        let run = &mut ctx.accounts.run;
+        run.total_withdrawn = run.total_withdrawn
+            .checked_add(user_share)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+        run.withdrawn_count = run.withdrawn_count
+            .checked_add(1)
+            .ok_or(ErrorCode::ArithmeticOverflow)?;
+
+        msg!(
+            "User {} withdrew {} USDC from run #{} ({}/{})",
+            ctx.accounts.user.key(),
+            user_share,
+            run_id,
+            run.withdrawn_count,
+            run.participant_count
+        );
         Ok(())
     }
 
     /// Update user's vote statistics (called by backend after each voting round)
     pub fn update_vote_stats(
         ctx: Context<UpdateVoteStats>,
-        run_id: u64,
-        user_pubkey: Pubkey,
+        _run_id: u64,
+        _user_pubkey: Pubkey,
         correct_votes: u8,
         total_votes: u8,
     ) -> Result<()> {
@@ -256,6 +374,36 @@ pub mod instinct_trading {
     pub fn unpause_platform(ctx: Context<AdminAction>) -> Result<()> {
         ctx.accounts.platform.is_paused = false;
         msg!("Platform unpaused by authority");
+        Ok(())
+    }
+
+    /// Withdraw collected platform fees (admin only)
+    pub fn withdraw_platform_fees(
+        ctx: Context<WithdrawPlatformFees>,
+        amount: u64,
+    ) -> Result<()> {
+        require!(
+            amount <= ctx.accounts.platform_fee_vault.amount,
+            ErrorCode::InsufficientVaultFunds
+        );
+
+        let platform_bump = ctx.accounts.platform.bump;
+        let platform_seeds = &[
+            b"platform".as_ref(),
+            &[platform_bump],
+        ];
+        let signer = &[&platform_seeds[..]];
+
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.platform_fee_vault.to_account_info(),
+            to: ctx.accounts.destination_token_account.to_account_info(),
+            authority: ctx.accounts.platform.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::transfer(cpi_ctx, amount)?;
+
+        msg!("Platform fees withdrawn: {} USDC", amount);
         Ok(())
     }
 
@@ -301,10 +449,12 @@ pub struct Platform {
     pub total_runs: u64,             // Total runs created
     pub is_paused: bool,             // Emergency pause flag
     pub bump: u8,                    // PDA bump
+    pub total_fees_collected: u64,   // Total fees collected across all runs
+    pub platform_fee_vault: Pubkey,  // Platform fee vault address
 }
 
 impl Platform {
-    pub const LEN: usize = 8 + 32 + 2 + 8 + 1 + 1;
+    pub const LEN: usize = 8 + 32 + 2 + 8 + 1 + 1 + 8 + 32;
 }
 
 #[account]
@@ -313,7 +463,10 @@ pub struct Run {
     pub authority: Pubkey,           // Platform authority
     pub status: RunStatus,           // Current status
     pub total_deposited: u64,        // Total USDC deposited
-    pub final_balance: u64,          // Final balance after trading
+    pub final_balance: u64,          // Final balance after trading (after fee deduction)
+    pub platform_fee_amount: u64,    // Platform fee collected for this run
+    pub total_withdrawn: u64,        // Total amount withdrawn by users
+    pub withdrawn_count: u16,        // Number of users who have withdrawn
     pub participant_count: u16,      // Number of participants
     pub min_deposit: u64,            // Minimum deposit (e.g., 10 USDC)
     pub max_deposit: u64,            // Maximum deposit (e.g., 100 USDC)
@@ -325,7 +478,7 @@ pub struct Run {
 }
 
 impl Run {
-    pub const LEN: usize = 8 + 8 + 32 + 1 + 8 + 8 + 2 + 8 + 8 + 2 + 8 + 8 + 8 + 1;
+    pub const LEN: usize = 8 + 8 + 32 + 1 + 8 + 8 + 8 + 8 + 2 + 2 + 8 + 8 + 2 + 8 + 8 + 8 + 1;
 }
 
 #[account]
@@ -348,7 +501,7 @@ impl UserParticipation {
 // Enums
 // ============================================================================
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq)]
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     Waiting,   // Accepting deposits
     Active,    // Trading in progress
@@ -370,9 +523,22 @@ pub struct InitializePlatform<'info> {
     )]
     pub platform: Account<'info, Platform>,
     
+    #[account(
+        init,
+        payer = authority,
+        token::mint = usdc_mint,
+        token::authority = platform,
+        seeds = [b"platform_fee_vault"],
+        bump
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+    
+    pub usdc_mint: Account<'info, token::Mint>,
+    
     #[account(mut)]
     pub authority: Signer<'info>,
     
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
 
@@ -490,7 +656,11 @@ pub struct ManageRun<'info> {
 #[derive(Accounts)]
 #[instruction(run_id: u64)]
 pub struct SettleRun<'info> {
-    #[account(seeds = [b"platform"], bump = platform.bump)]
+    #[account(
+        mut,
+        seeds = [b"platform"],
+        bump = platform.bump
+    )]
     pub platform: Account<'info, Platform>,
     
     #[account(
@@ -502,18 +672,28 @@ pub struct SettleRun<'info> {
     pub run: Account<'info, Run>,
     
     #[account(
+        mut,
         seeds = [b"vault", run_id.to_le_bytes().as_ref()],
         bump
     )]
     pub run_vault: Account<'info, TokenAccount>,
     
+    #[account(
+        mut,
+        seeds = [b"platform_fee_vault"],
+        bump
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+    
     pub authority: Signer<'info>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
 #[instruction(run_id: u64)]
 pub struct Withdraw<'info> {
     #[account(
+        mut,
         seeds = [b"run", run_id.to_le_bytes().as_ref()],
         bump = run.bump
     )]
@@ -575,6 +755,29 @@ pub struct AdminAction<'info> {
     pub platform: Account<'info, Platform>,
     
     pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawPlatformFees<'info> {
+    #[account(
+        seeds = [b"platform"],
+        bump = platform.bump,
+        has_one = authority
+    )]
+    pub platform: Account<'info, Platform>,
+    
+    #[account(
+        mut,
+        seeds = [b"platform_fee_vault"],
+        bump
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub destination_token_account: Account<'info, TokenAccount>,
+    
+    pub authority: Signer<'info>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -666,4 +869,7 @@ pub enum ErrorCode {
     
     #[msg("Insufficient funds in vault")]
     InsufficientVaultFunds,
+    
+    #[msg("Arithmetic overflow occurred")]
+    ArithmeticOverflow,
 }

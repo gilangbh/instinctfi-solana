@@ -29,6 +29,32 @@ This program implements a **hybrid approach**:
 - `update_vote_stats` - Update user's voting statistics
 - `emergency_withdraw` - Emergency fund recovery (requires pause)
 
+## 👨‍💻 Developer Setup
+
+### Quick Start for New Developers
+
+```bash
+# 1. Clone the repository
+git clone <repo-url>
+cd instinctfi-solana
+
+# 2. Run setup script
+chmod +x scripts/setup-new-developer.sh
+./scripts/setup-new-developer.sh
+
+# 3. Read the detailed guides
+cat SETUP_GUIDE.md
+cat TEAM_WORKFLOW.md
+```
+
+**Key Points:**
+- ✅ **Everyone uses the SAME program ID on devnet** (`7gmTYKqNX4xKsrd6NfNRscL3XSUoUTQyyTPhySWoABUc`)
+- ✅ **Each developer has their OWN wallet** (`~/.config/solana/id.json`)
+- ✅ The program ID is in git (shared by all)
+- ❌ Your wallet is NOT in git (personal to you)
+
+See `TEAM_WORKFLOW.md` for detailed team collaboration guide.
+
 ## 🧪 Testing
 
 ### Prerequisites
@@ -42,20 +68,24 @@ This program implements a **hybrid approach**:
 
 ### Build the Program
 ```bash
-cd solana-program
 anchor build
 ```
 
 ### Run Tests
+
+**On Local Validator (Fast)**
 ```bash
-# Start local validator (in a separate terminal)
-solana-test-validator
+# Terminal 1: Start local validator
+solana-test-validator --reset
 
-# Run all tests
-anchor test --skip-local-validator
-
-# Or test with fresh validator
+# Terminal 2: Run tests (uses your personal wallet)
 anchor test
+```
+
+**On Devnet (Real Network)**
+```bash
+# Uses shared devnet program
+anchor test --skip-local-validator --provider.cluster devnet
 ```
 
 ### Test Coverage

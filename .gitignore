@@ -6,3 +6,14 @@ target
 node_modules
 test-ledger
 .yarn
+
+# Wallet files - NEVER COMMIT THESE!
+**/id.json
+**/*-keypair.json
+**/.env
+**/.env.local
+.env*
+
+# Build artifacts (keep IDL in git, but ignore other build files)
+target/deploy/*.so
+target/release/

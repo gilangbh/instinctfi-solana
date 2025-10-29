@@ -1,18 +1,26 @@
 [toolchain]
+anchor_version = "0.31.1"
 
 [features]
 seeds = false
 skip-lint = false
 
 [programs.localnet]
-instinct_trading = "6EYowRZgeA51JkwPJ5R1wnhxTYHYumnGYrNZwcGegCnc"
+# instinct_trading = "6EYowRZgeA51JkwPJ5R1wnhxTYHYumnGYrNZwcGegCnc" // previous id
+instinct_trading = "7gmTYKqNX4xKsrd6NfNRscL3XSUoUTQyyTPhySWoABUc"
+
+[programs.devnet]
+instinct_trading = "7gmTYKqNX4xKsrd6NfNRscL3XSUoUTQyyTPhySWoABUc"
+
+# [programs.mainnet]
+# instinct_trading = "YOUR_MAINNET_PROGRAM_ID_HERE"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Localnet"
-wallet = "/home/bhagaskara/.config/solana/id.json"
+cluster = "Devnet"
+wallet = "~/.config/solana/id.json"
 
 [scripts]
 test = "yarn run mocha -t 1000000 tests/"

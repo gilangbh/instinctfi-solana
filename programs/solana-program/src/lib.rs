@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
-declare_id!("6EYowRZgeA51JkwPJ5R1wnhxTYHYumnGYrNZwcGegCnc");
+declare_id!("7gmTYKqNX4xKsrd6NfNRscL3XSUoUTQyyTPhySWoABUc");
 
 #[program]
 pub mod instinct_trading {

@@ -7,10 +7,10 @@ skip-lint = false
 
 [programs.localnet]
 # instinct_trading = "6EYowRZgeA51JkwPJ5R1wnhxTYHYumnGYrNZwcGegCnc" // previous id
-instinct_trading = "7gmTYKqNX4xKsrd6NfNRscL3XSUoUTQyyTPhySWoABUc"
+instinct_trading = "83TVAu61Hv4v7zvPszszYFJLTwARG5LPhoTbGnkEmaQD"
 
 [programs.devnet]
-instinct_trading = "7gmTYKqNX4xKsrd6NfNRscL3XSUoUTQyyTPhySWoABUc"
+instinct_trading = "83TVAu61Hv4v7zvPszszYFJLTwARG5LPhoTbGnkEmaQD"
 
 # [programs.mainnet]
 # instinct_trading = "YOUR_MAINNET_PROGRAM_ID_HERE"

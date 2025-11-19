@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
-declare_id!("7gmTYKqNX4xKsrd6NfNRscL3XSUoUTQyyTPhySWoABUc");
+declare_id!("83TVAu61Hv4v7zvPszszYFJLTwARG5LPhoTbGnkEmaQD");
 
 #[program]
 pub mod instinct_trading {
@@ -363,6 +363,55 @@ pub mod instinct_trading {
         Ok(())
     }
 
+    /// Record a trade execution (called by backend after each trade on Drift)
+    pub fn record_trade(
+        ctx: Context<RecordTrade>,
+        run_id: u64,
+        round: u8,
+        direction: TradeDirection,
+        entry_price: u64,  // In micro-USDC (6 decimals, e.g., 150000000 = $150.00)
+        exit_price: u64,   // In micro-USDC (6 decimals, 0 if position still open)
+        pnl: i64,          // In micro-USDC (can be negative, 0 if position still open)
+        leverage: u8,      // Stored as integer (e.g., 10 = 1.0x, 20 = 2.0x)
+        position_size_percent: u8,  // 10-100 (percentage of pool)
+    ) -> Result<()> {
+        let run = &ctx.accounts.run;
+        
+        require!(run.status == RunStatus::Active, ErrorCode::InvalidRunStatus);
+        require!(run.run_id == run_id, ErrorCode::InvalidRunId);
+        require!(leverage >= 10 && leverage <= 200, ErrorCode::InvalidLeverage); // 1.0x to 20.0x
+        require!(position_size_percent >= 10 && position_size_percent <= 100, ErrorCode::InvalidPositionSize);
+        
+        let trade = &mut ctx.accounts.trade_record;
+        trade.run_id = run_id;
+        trade.round = round;
+        trade.direction = direction;
+        trade.entry_price = entry_price;
+        trade.exit_price = exit_price;
+        trade.pnl = pnl;
+        trade.leverage = leverage;
+        trade.position_size_percent = position_size_percent;
+        trade.executed_at = Clock::get()?.unix_timestamp;
+        trade.bump = ctx.bumps.trade_record;
+        
+        let direction_str = match direction {
+            TradeDirection::Long => "LONG",
+            TradeDirection::Short => "SHORT",
+            TradeDirection::Skip => "SKIP",
+        };
+        
+        msg!("Trade recorded: Run #{} Round {} - {} - Entry: {} Exit: {} PnL: {}", 
+            run_id,
+            round,
+            direction_str,
+            entry_price,
+            exit_price,
+            pnl
+        );
+        
+        Ok(())
+    }
+
     /// Emergency pause (admin only)
     pub fn pause_platform(ctx: Context<AdminAction>) -> Result<()> {
         ctx.accounts.platform.is_paused = true;
@@ -497,6 +546,24 @@ impl UserParticipation {
     pub const LEN: usize = 8 + 32 + 8 + 8 + 8 + 1 + 1 + 1 + 1;
 }
 
+#[account]
+pub struct TradeRecord {
+    pub run_id: u64,                 // Associated run
+    pub round: u8,                   // Round number (1-12)
+    pub direction: TradeDirection,   // Trade direction
+    pub entry_price: u64,           // Entry price in micro-USDC (6 decimals)
+    pub exit_price: u64,            // Exit price in micro-USDC (0 if still open)
+    pub pnl: i64,                    // PnL in micro-USDC (can be negative, 0 if still open)
+    pub leverage: u8,                // Leverage as integer (10 = 1.0x, 20 = 2.0x, etc.)
+    pub position_size_percent: u8,  // Position size as percentage (10-100)
+    pub executed_at: i64,           // Unix timestamp
+    pub bump: u8,                    // PDA bump
+}
+
+impl TradeRecord {
+    pub const LEN: usize = 8 + 8 + 1 + 1 + 8 + 8 + 8 + 1 + 1 + 8 + 1;
+}
+
 // ============================================================================
 // Enums
 // ============================================================================
@@ -506,6 +573,13 @@ pub enum RunStatus {
     Waiting,   // Accepting deposits
     Active,    // Trading in progress
     Settled,   // Trading ended, ready for withdrawals
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum TradeDirection {
+    Long,
+    Short,
+    Skip,
 }
 
 // ============================================================================
@@ -745,6 +819,34 @@ pub struct UpdateVoteStats<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(run_id: u64, round: u8)]
+pub struct RecordTrade<'info> {
+    #[account(seeds = [b"platform"], bump = platform.bump)]
+    pub platform: Account<'info, Platform>,
+    
+    #[account(
+        seeds = [b"run", run_id.to_le_bytes().as_ref()],
+        bump = run.bump,
+        has_one = authority
+    )]
+    pub run: Account<'info, Run>,
+    
+    #[account(
+        init,
+        payer = authority,
+        space = TradeRecord::LEN,
+        seeds = [b"trade", run_id.to_le_bytes().as_ref(), round.to_le_bytes().as_ref()],
+        bump
+    )]
+    pub trade_record: Account<'info, TradeRecord>,
+    
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct AdminAction<'info> {
     #[account(
         mut,
@@ -872,4 +974,13 @@ pub enum ErrorCode {
     
     #[msg("Arithmetic overflow occurred")]
     ArithmeticOverflow,
+    
+    #[msg("Invalid run ID")]
+    InvalidRunId,
+    
+    #[msg("Invalid leverage (must be between 1.0x and 20.0x)")]
+    InvalidLeverage,
+    
+    #[msg("Invalid position size (must be between 10% and 100%)")]
+    InvalidPositionSize,
 }

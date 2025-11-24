@@ -100,7 +100,7 @@ pub mod instinct_trading {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::transfer(cpi_ctx, amount)?;
 
-        // Update user participation record
+        // Initialize user participation record
         let participation = &mut ctx.accounts.user_participation;
         participation.user = ctx.accounts.user.key();
         participation.run_id = run_id;
@@ -295,11 +295,6 @@ pub mod instinct_trading {
                 user_share = base_share;
             }
 
-            // Ensure we don't exceed vault balance
-            require!(
-                user_share <= ctx.accounts.run_vault.amount,
-                ErrorCode::InsufficientVaultFunds
-            );
         }
 
         // Transfer USDC from vault to user
@@ -423,6 +418,18 @@ pub mod instinct_trading {
     pub fn unpause_platform(ctx: Context<AdminAction>) -> Result<()> {
         ctx.accounts.platform.is_paused = false;
         msg!("Platform unpaused by authority");
+        Ok(())
+    }
+
+    /// Transfer platform authority to a new address (admin only)
+    pub fn transfer_authority(
+        ctx: Context<TransferAuthority>,
+        new_authority: Pubkey,
+    ) -> Result<()> {
+        let platform = &mut ctx.accounts.platform;
+        let old_authority = platform.authority;
+        platform.authority = new_authority;
+        msg!("Platform authority transferred from {} to {}", old_authority, new_authority);
         Ok(())
     }
 
@@ -607,6 +614,7 @@ pub struct InitializePlatform<'info> {
     )]
     pub platform_fee_vault: Account<'info, TokenAccount>,
     
+    
     pub usdc_mint: Account<'info, token::Mint>,
     
     #[account(mut)]
@@ -766,6 +774,9 @@ pub struct SettleRun<'info> {
 #[derive(Accounts)]
 #[instruction(run_id: u64)]
 pub struct Withdraw<'info> {
+    #[account(seeds = [b"platform"], bump = platform.bump)]
+    pub platform: Account<'info, Platform>,
+    
     #[account(
         mut,
         seeds = [b"run", run_id.to_le_bytes().as_ref()],
@@ -848,6 +859,19 @@ pub struct RecordTrade<'info> {
 
 #[derive(Accounts)]
 pub struct AdminAction<'info> {
+    #[account(
+        mut,
+        seeds = [b"platform"],
+        bump = platform.bump,
+        has_one = authority
+    )]
+    pub platform: Account<'info, Platform>,
+    
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct TransferAuthority<'info> {
     #[account(
         mut,
         seeds = [b"platform"],
@@ -960,14 +984,17 @@ pub enum ErrorCode {
     #[msg("Invalid number of participant shares")]
     InvalidSharesCount,
     
-    #[msg("Vault balance does not match reported final balance")]
-    VaultBalanceMismatch,
-    
     #[msg("Run is not settled yet")]
     RunNotSettled,
     
+    #[msg("Vault balance does not match reported final balance")]
+    VaultBalanceMismatch,
+    
     #[msg("User has already withdrawn")]
     AlreadyWithdrawn,
+    
+    #[msg("User has already deposited to this run")]
+    AlreadyDeposited,
     
     #[msg("Insufficient funds in vault")]
     InsufficientVaultFunds,
